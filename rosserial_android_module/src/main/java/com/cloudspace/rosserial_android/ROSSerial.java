@@ -54,10 +54,18 @@ import rosserial_msgs.TopicInfo;
  * @author Adam Stambler
  */
 public class ROSSerial implements Runnable {
+    static final String TAG = "ROSSerial";
+
     /**
-     * Flags for marking beginning of packet transmission
+     * Flags for marking beginning of packet transmission (0xfe is Hydro and later protocol)
      */
-    public static final byte[] FLAGS = {(byte) 0xff, (byte) 0xfd};
+    public static final byte[] FLAGS = {(byte) 0xff, (byte) 0xfe};
+
+    /**
+     * Maximum size for the incomming message data in bytes
+     * Same as Message out buffer size in rosserial_arduino
+     */
+    private static final int MAX_MSG_DATA_SIZE = 256;
 
     /**
      * Output stream for the serial line used for communication.
@@ -116,15 +124,17 @@ public class ROSSerial implements Runnable {
 
     // parsing state machine variables/enumes
     private enum PACKET_STATE {
-        FLAGA, FLAGB, MESSAGE_LENGTH, LENGTH_CHECKSUM, TOPIC_ID, DATA, MSG_CHECKSUM
+        FLAGA, FLAGB, MESSAGE_LENGTH, LENGTH_CHECKSUM, TOPIC_ID, DATA, MSG_BEFORE_CHECKSUM, MSG_CHECKSUM
     }
 
     private PACKET_STATE packet_state;
     private byte[] topicIdBytes = new byte[2];
     private byte[] messageLengthBytes = new byte[2];
+    private int length_checksum = 0;
     private int data_len = 0;
     private int byte_index = 0;
     byte[] buffer = new byte[256];
+    private byte[] data = new byte[MAX_MSG_DATA_SIZE];
 
     /**
      * Packet handler for writing to the other endpoint.
@@ -137,7 +147,7 @@ public class ROSSerial implements Runnable {
             if (lastPacketTransmittedAt == -1 || System.currentTimeMillis() - 1 > lastPacketTransmittedAt) {
                 lastPacketTransmittedAt = System.currentTimeMillis();
                 byte[] packet = generatePacket(data, topicId);
-                Log.d("SENDING PACKET @ " + packet.length, BinaryUtils.byteArrayToHexString(packet));
+                Log.d(TAG, " SENDING PACKET @" + packet.length + ": " + BinaryUtils.byteArrayToHexString(packet));
                 try {
                     ostream.write(packet);
                 } catch (Exception e) {
@@ -145,7 +155,7 @@ public class ROSSerial implements Runnable {
                     e.printStackTrace();
                 }
             } else {
-                Log.d("IGNORING SEND", "Too many calls");
+                Log.w(TAG, "Too many calls");
             }
         }
     };
@@ -188,7 +198,7 @@ public class ROSSerial implements Runnable {
         errorHandler = handler;
     }
 
-    private byte[] data;
+    //private byte[] data;
 
     /**
      * Shut this endpoint down.
@@ -214,15 +224,13 @@ public class ROSSerial implements Runnable {
             // but node.isOk() does not work, its never true...
             while (running) {
                 try {
+                    if (istream.available() < 8) continue;
+
                     int bytes = istream.read(buffer);
-                    if (bytes > 8 && packet_state == PACKET_STATE.FLAGA) {
-                        Log.d("GOT FLAG A", "STARTING PARSE");
-                        data = new byte[(buffer[3] << 8) | (buffer[2])];
-                        for (int i = 0; i < data.length + 8; i++) {
-                            handleByte(buffer[i]);
-                        }
-                    } else {
-                        resetPacket();
+                    //Log.d("p", "Read " + bytes + " bytes: " + BinaryUtils.byteArrayToHexString(buffer, bytes));
+
+                    for (int i = 0; i < bytes; i++) {
+                        handleByte(buffer[i]);
                     }
                 } catch (IOException e) {
                     e.printStackTrace();
@@ -253,7 +261,7 @@ public class ROSSerial implements Runnable {
      * ! reset parsing statemachine
      */
     private void resetPacket() {
-        Log.d("ROSSerial", "RESTING PACKET");
+        //Log.d(TAG, "RESTING PACKET");
         byte_index = 0;
         data_len = 0;
         messageLengthBytes = new byte[2];
@@ -267,7 +275,7 @@ public class ROSSerial implements Runnable {
      * the byte was successfully parsed
      */
     private boolean handleByte(byte b) {
-//        Log.d("HANDLE BYTE", byte_index + " : " + BinaryUtils.byteToHexString(b) + " : " + packet_state);
+        //Log.d("HANDLE BYTE", byte_index + " : " + BinaryUtils.byteToHexString(b) + " : " + packet_state);
         switch (packet_state) {
             case FLAGA:
                 if (b == (byte) 0xff) {
@@ -275,7 +283,7 @@ public class ROSSerial implements Runnable {
                 }
                 break;
             case FLAGB:
-                if (b == (byte) 0xfd) {
+                if (b == (byte) 0xfe) {
                     packet_state = PACKET_STATE.MESSAGE_LENGTH;
                 } else {
                     resetPacket();
@@ -292,7 +300,13 @@ public class ROSSerial implements Runnable {
                 break;
 
             case LENGTH_CHECKSUM:
-                data_len = (messageLengthBytes[1] << 8) | (messageLengthBytes[0]);
+                length_checksum = b & 0xff;
+                data_len = (messageLengthBytes[1] << 8) | messageLengthBytes[0];
+                if ((length_checksum + ((data_len >> 8) + data_len) != 0xff)) {
+                    Log.w(TAG, "Bad message header length checksum. Dropping message from client.");
+                    resetPacket();
+                    return false;
+                }
                 packet_state = PACKET_STATE.TOPIC_ID;
                 break;
             case TOPIC_ID:
@@ -300,6 +314,7 @@ public class ROSSerial implements Runnable {
                 byte_index++;
                 if (byte_index == 2) {
                     byte_index = 0;
+                    data = new byte[data_len];
                     packet_state = PACKET_STATE.DATA;
                 }
                 break;
@@ -311,20 +326,20 @@ public class ROSSerial implements Runnable {
                 }
                 break;
             case MSG_CHECKSUM:
-                int chk = (0xff & b);
+                int chk = 0;
                 for (int i = 0; i < 2; i++)
                     chk += (0xff & topicIdBytes[i]);
                 for (int i = 0; i < data_len; i++) {
                     chk += (0xff & data[i]);
                 }
 
-                Log.d("Msg checksum!", BinaryUtils.byteToHexString(b) + " : " + String.valueOf(BinaryUtils.byteToHexString((byte) chk)) + " : " + (chk % 256 != 255));
-
-                if ((chk % 256 != 255)) {
+                //Log.d("Msg checksum!", BinaryUtils.byteToHexString(b) + " : " + String.valueOf(BinaryUtils.byteToHexString((byte) chk)) + " : " + (chk % 256 != 255));
+                int topic_id = (topicIdBytes[1] << 8) | (topicIdBytes[0]);
+                if (((chk % 256) + (0xff & b) != 0xff)) {
+                    Log.w(TAG, String.format("Rejecting message on topicId=%1$d, length=%2$d with bad checksum", topic_id, data_len));
                     resetPacket();
                     return false;
                 } else {
-                    int topic_id = (topicIdBytes[1] << 8) | (topicIdBytes[0]);
                     resetPacket();
                     protocol.parsePacket(topic_id, data);
                 }
